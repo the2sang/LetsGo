@@ -3,9 +3,10 @@ package server
 import (
 	"context"
 
+	api "github.com/the2sang/LetsGo/SecureYourServices/api/v1"
+
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
-	api "github.com/the2sang/LetsGo/WriteALogPackage/api/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -13,8 +14,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type CommitLog interface {
+	Append(*api.Record) (uint64, error)
+	Read(uint64) (*api.Record, error)
+}
+
 type Config struct {
-	CommitLog  CommitLog
+	CommitLog
 	Authorizer Authorizer
 }
 
@@ -24,39 +30,44 @@ const (
 	consumeAction  = "consume"
 )
 
+var _ api.LogServer = (*grpcServer)(nil)
+
 type grpcServer struct {
+	api.UnimplementedLogServer
 	*Config
 }
 
-func newgrpcServer(config *Config) (*grpcServer, error) {
-	srv := &grpcServer{
+func newgrpcServer(config *Config) (srv *grpcServer, err error) {
+	srv = &grpcServer{
 		Config: config,
 	}
 	return srv, nil
 }
 
-func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
-	opts = append(opts, grpc.StreamInterceptor(
-		grpc_middleware.ChainStreamServer(
-			grpc_auth.StreamServerInterceptor(authenticate),
-		)), grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-		grpc_auth.UnaryServerInterceptor(authenticate),
-	)))
+func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (
+	*grpc.Server,
+	error,
+) {
+	opts = append(opts,
+		grpc.StreamInterceptor(
+			grpc_middleware.ChainStreamServer(
+				grpc_auth.StreamServerInterceptor(authenticate),
+			)),
+		grpc.UnaryInterceptor(
+			grpc_middleware.ChainUnaryServer(
+				grpc_auth.UnaryServerInterceptor(authenticate),
+			)))
 	gsrv := grpc.NewServer(opts...)
 	srv, err := newgrpcServer(config)
 	if err != nil {
 		return nil, err
 	}
-	api.RegisterLogService(gsrv, &api.LogService{
-		Produce:       srv.Produce,
-		Consume:       srv.Consume,
-		ConsumeStream: srv.ConsumeStream,
-		ProduceStream: srv.ProduceStream,
-	})
+	api.RegisterLogServer(gsrv, srv)
 	return gsrv, nil
 }
 
-func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api.ProduceResponse, error) {
+func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (
+	*api.ProduceResponse, error) {
 	if err := s.Authorizer.Authorize(
 		subject(ctx),
 		objectWildcard,
@@ -71,10 +82,8 @@ func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api
 	return &api.ProduceResponse{Offset: offset}, nil
 }
 
-// START: consume_authorize
 func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (
 	*api.ConsumeResponse, error) {
-	// START_HIGHLIGHT
 	if err := s.Authorizer.Authorize(
 		subject(ctx),
 		objectWildcard,
@@ -82,19 +91,15 @@ func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (
 	); err != nil {
 		return nil, err
 	}
-	// END_HIGHLIGHT
 	record, err := s.CommitLog.Read(req.Offset)
 	if err != nil {
 		return nil, err
 	}
 	return &api.ConsumeResponse{Record: record}, nil
 }
-
-// END: consume_authorize
-// END: request_response
-
-// START: stream
-func (s *grpcServer) ProduceStream(stream api.Log_ProduceStreamServer) error {
+func (s *grpcServer) ProduceStream(
+	stream api.Log_ProduceStreamServer,
+) error {
 	for {
 		req, err := stream.Recv()
 		if err != nil {
@@ -135,24 +140,10 @@ func (s *grpcServer) ConsumeStream(
 	}
 }
 
-// END: stream
-
-// START: commitlog
-type CommitLog interface {
-	Append(*api.Record) (uint64, error)
-	Read(uint64) (*api.Record, error)
-}
-
-// END: commitlog
-
-// START: authorizer
 type Authorizer interface {
 	Authorize(subject, object, action string) error
 }
 
-// END: authorizer
-
-// START: authenticate
 func authenticate(ctx context.Context) (context.Context, error) {
 	peer, ok := peer.FromContext(ctx)
 	if !ok {
@@ -163,10 +154,7 @@ func authenticate(ctx context.Context) (context.Context, error) {
 	}
 
 	if peer.AuthInfo == nil {
-		return ctx, status.New(
-			codes.Unauthenticated,
-			"no transport security being used",
-		).Err()
+		return context.WithValue(ctx, subjectContextKey{}, ""), nil
 	}
 
 	tlsInfo := peer.AuthInfo.(credentials.TLSInfo)
@@ -181,3 +169,4 @@ func subject(ctx context.Context) string {
 }
 
 type subjectContextKey struct{}
+
